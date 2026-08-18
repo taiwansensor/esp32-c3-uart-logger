@@ -7,7 +7,7 @@
 搜尋：
 
 ```cpp
-constexpr char kVersion[] = "0.1.0-alpha.2";
+constexpr char kVersion[] = "0.1.0-alpha.3";
 constexpr char kDefaultHostname[] = "uart-logger";
 ```
 
@@ -49,9 +49,11 @@ constexpr size_t kRamRingSize = 24 * 1024;
 ```cpp
 constexpr size_t kMainSegmentLimit = 384 * 1024;
 constexpr size_t kPanicFileLimit = 128 * 1024;
+constexpr size_t kWifiSegmentLimit = 64 * 1024;
+constexpr uint32_t kWifiHeartbeatMs = 5 * 60 * 1000;
 ```
 
-目前共有兩個一般日誌及三個 Panic 檔案。所有上限加總後必須為 LittleFS 保留檔案系統管理空間，不能直接用滿分割區。
+目前共有兩個一般日誌、三個 Panic 檔案及兩個 Wi-Fi 事件檔案。`kWifiHeartbeatMs` 控制 AP 狀態取樣週期；連線與斷線事件不受此週期限制，會立即寫入。所有上限加總後必須為 LittleFS 保留檔案系統管理空間，不能直接用滿分割區。
 
 ## 新增 Panic 關鍵字
 
