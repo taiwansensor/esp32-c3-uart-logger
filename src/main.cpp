@@ -10,6 +10,7 @@
 #include <WiFi.h>
 
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/stream_buffer.h>
 #include <freertos/task.h>
 
@@ -18,7 +19,7 @@
 
 namespace {
 
-constexpr char kVersion[] = "0.1.0-alpha.2";
+constexpr char kVersion[] = "0.1.0-alpha.3";
 constexpr char kDefaultHostname[] = "uart-logger";
 constexpr char kApPassword[] = "uartlogger";
 constexpr uint32_t kDefaultBaud = 115200;
@@ -29,10 +30,21 @@ constexpr size_t kUartStreamSize = 32 * 1024;
 constexpr size_t kRamRingSize = 24 * 1024;
 constexpr size_t kMainSegmentLimit = 384 * 1024;
 constexpr size_t kPanicFileLimit = 128 * 1024;
+constexpr size_t kWifiSegmentLimit = 64 * 1024;
 constexpr uint32_t kPanicCaptureMs = 90 * 1000;
 constexpr uint32_t kLogFlushMs = 1000;
 constexpr uint32_t kWifiConnectMs = 15000;
+constexpr uint32_t kWifiHeartbeatMs = 5 * 60 * 1000;
 constexpr size_t kTcpClientCount = 3;
+constexpr size_t kWifiEventQueueLength = 32;
+
+struct WifiEventRecord {
+  uint32_t uptime_ms;
+  arduino_event_id_t event_id;
+  uint8_t reason;
+  uint8_t channel;
+  uint8_t client_mac[6];
+};
 
 struct RuntimeConfig {
   String ssid;
@@ -53,10 +65,13 @@ WiFiServer *tcp_server = nullptr;
 WiFiClient tcp_clients[kTcpClientCount];
 StreamBufferHandle_t uart_stream = nullptr;
 TaskHandle_t uart_reader_task_handle = nullptr;
+QueueHandle_t wifi_event_queue = nullptr;
 
 File main_log;
 File panic_log;
+File wifi_log;
 uint8_t active_segment = 0;
+uint8_t active_wifi_segment = 0;
 uint8_t next_panic_index = 0;
 uint32_t panic_capture_until = 0;
 uint32_t last_flush_ms = 0;
@@ -69,6 +84,19 @@ volatile uint32_t last_uart_error_ms = 0;
 volatile uint32_t last_uart_overflow_ms = 0;
 volatile uint32_t uart_stream_drop_bytes = 0;
 uint32_t boot_count = 0;
+uint32_t wifi_connected_events = 0;
+uint32_t wifi_got_ip_events = 0;
+uint32_t wifi_disconnected_events = 0;
+uint32_t wifi_lost_ip_events = 0;
+uint32_t fallback_ap_start_events = 0;
+uint32_t fallback_ap_client_connects = 0;
+uint32_t fallback_ap_client_disconnects = 0;
+uint32_t last_wifi_connected_ms = 0;
+uint32_t last_wifi_got_ip_ms = 0;
+uint32_t last_wifi_disconnected_ms = 0;
+uint32_t last_wifi_heartbeat_ms = 0;
+uint8_t last_wifi_disconnect_reason = 0;
+volatile uint32_t wifi_event_queue_drops = 0;
 bool filesystem_ready = false;
 bool ap_active = false;
 bool mdns_ready = false;
@@ -172,6 +200,36 @@ String panic_log_name(uint8_t index) {
   return String(F("/panic-")) + String(index) + F(".log");
 }
 
+String wifi_log_name(uint8_t index) {
+  return String(F("/wifi-")) + String(index) + F(".log");
+}
+
+String format_mac(const uint8_t *mac) {
+  char buffer[18];
+  snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buffer);
+}
+
+const char *wifi_event_name(arduino_event_id_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_OFF: return "WIFI_OFF";
+    case ARDUINO_EVENT_WIFI_READY: return "WIFI_READY";
+    case ARDUINO_EVENT_WIFI_STA_START: return "STA_START";
+    case ARDUINO_EVENT_WIFI_STA_STOP: return "STA_STOP";
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED: return "STA_CONNECTED";
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: return "STA_DISCONNECTED";
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP: return "STA_GOT_IP";
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP: return "STA_LOST_IP";
+    case ARDUINO_EVENT_WIFI_AP_START: return "AP_START";
+    case ARDUINO_EVENT_WIFI_AP_STOP: return "AP_STOP";
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED: return "AP_CLIENT_CONNECTED";
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED: return "AP_CLIENT_DISCONNECTED";
+    case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED: return "AP_CLIENT_IP_ASSIGNED";
+    default: return "OTHER";
+  }
+}
+
 size_t file_size(const String &path) {
   if (!filesystem_ready) return 0;
   File file = LittleFS.open(path, FILE_READ);
@@ -240,6 +298,153 @@ void rotate_main_log_if_needed() {
   LittleFS.remove(next_name);
   preferences.putUChar("segment", active_segment);
   open_main_log();
+}
+
+bool open_wifi_log() {
+  if (!filesystem_ready) return false;
+  if (wifi_log) wifi_log.close();
+  wifi_log = LittleFS.open(wifi_log_name(active_wifi_segment), FILE_APPEND);
+  if (!wifi_log) return false;
+  write_session_header(wifi_log, "WIFI MONITOR SESSION");
+  wifi_log.flush();
+  return true;
+}
+
+void rotate_wifi_log_if_needed() {
+  if (!wifi_log || wifi_log.size() < kWifiSegmentLimit) return;
+  wifi_log.flush();
+  wifi_log.close();
+  active_wifi_segment = static_cast<uint8_t>((active_wifi_segment + 1) % 2);
+  const String next_name = wifi_log_name(active_wifi_segment);
+  LittleFS.remove(next_name);
+  preferences.putUChar("wifi_segment", active_wifi_segment);
+  open_wifi_log();
+}
+
+void append_wifi_log(const String &event, const String &details = "") {
+  if (!wifi_log) return;
+  wifi_log.print(local_timestamp());
+  wifi_log.print(F(" event="));
+  wifi_log.print(event);
+  wifi_log.print(F(" uptime_ms="));
+  wifi_log.print(millis());
+  if (!details.isEmpty()) {
+    wifi_log.print(' ');
+    wifi_log.print(details);
+  }
+  wifi_log.print(F("\r\n"));
+  rotate_wifi_log_if_needed();
+}
+
+String wifi_link_details() {
+  String details;
+  if (WiFi.status() == WL_CONNECTED) {
+    details = F("sta=connected ssid=\"");
+    details += json_escape(WiFi.SSID());
+    details += F("\" bssid=");
+    details += WiFi.BSSIDstr();
+    details += F(" channel=");
+    details += String(WiFi.channel());
+    details += F(" rssi=");
+    details += String(WiFi.RSSI());
+    details += F(" ip=");
+    details += WiFi.localIP().toString();
+    details += F(" gateway=");
+    details += WiFi.gatewayIP().toString();
+  } else {
+    details = F("sta=disconnected ssid=\"");
+    details += json_escape(config.ssid);
+    details += '"';
+  }
+  details += F(" fallback_ap=");
+  details += ap_active ? F("on") : F("off");
+  details += F(" ap_clients=");
+  details += String(ap_active ? WiFi.softAPgetStationNum() : 0);
+  details += F(" heap=");
+  details += String(ESP.getFreeHeap());
+  return details;
+}
+
+void wifi_event_callback(arduino_event_id_t event, arduino_event_info_t info) {
+  if (wifi_event_queue == nullptr) return;
+  WifiEventRecord record{};
+  record.uptime_ms = millis();
+  record.event_id = event;
+  if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+    record.channel = info.wifi_sta_connected.channel;
+    memcpy(record.client_mac, info.wifi_sta_connected.bssid, sizeof(record.client_mac));
+  } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    record.reason = info.wifi_sta_disconnected.reason;
+    memcpy(record.client_mac, info.wifi_sta_disconnected.bssid, sizeof(record.client_mac));
+  } else if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+    memcpy(record.client_mac, info.wifi_ap_staconnected.mac, sizeof(record.client_mac));
+  } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+    memcpy(record.client_mac, info.wifi_ap_stadisconnected.mac, sizeof(record.client_mac));
+  }
+  if (xQueueSend(wifi_event_queue, &record, 0) != pdTRUE) ++wifi_event_queue_drops;
+}
+
+void service_wifi_monitor(bool force_heartbeat = false) {
+  if (wifi_event_queue != nullptr) {
+    WifiEventRecord record{};
+    while (xQueueReceive(wifi_event_queue, &record, 0) == pdTRUE) {
+      String details = String(F("event_uptime_ms=")) + String(record.uptime_ms);
+      switch (record.event_id) {
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+          ++wifi_connected_events;
+          last_wifi_connected_ms = record.uptime_ms;
+          details += F(" ap_bssid=");
+          details += format_mac(record.client_mac);
+          details += F(" channel=");
+          details += String(record.channel);
+          break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+          ++wifi_got_ip_events;
+          last_wifi_got_ip_ms = record.uptime_ms;
+          details += ' ';
+          details += wifi_link_details();
+          break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+          ++wifi_disconnected_events;
+          last_wifi_disconnected_ms = record.uptime_ms;
+          last_wifi_disconnect_reason = record.reason;
+          details += F(" ap_bssid=");
+          details += format_mac(record.client_mac);
+          details += F(" reason=");
+          details += String(record.reason);
+          details += F(" reason_name=\"");
+          details += WiFi.disconnectReasonName(static_cast<wifi_err_reason_t>(record.reason));
+          details += '"';
+          break;
+        }
+        case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+          ++wifi_lost_ip_events;
+          break;
+        case ARDUINO_EVENT_WIFI_AP_START:
+          ++fallback_ap_start_events;
+          break;
+        case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+          ++fallback_ap_client_connects;
+          details += F(" client=");
+          details += format_mac(record.client_mac);
+          break;
+        case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+          ++fallback_ap_client_disconnects;
+          details += F(" client=");
+          details += format_mac(record.client_mac);
+          break;
+        default:
+          break;
+      }
+      append_wifi_log(wifi_event_name(record.event_id), details);
+    }
+  }
+
+  const uint32_t now = millis();
+  if (force_heartbeat || last_wifi_heartbeat_ms == 0 || now - last_wifi_heartbeat_ms >= kWifiHeartbeatMs) {
+    append_wifi_log("HEARTBEAT", wifi_link_details());
+    last_wifi_heartbeat_ms = now;
+  }
 }
 
 bool line_has_panic_marker(String line) {
@@ -370,6 +575,7 @@ void service_target_uart() {
   if (main_log && now - last_flush_ms >= kLogFlushMs) {
     main_log.flush();
     if (panic_log) panic_log.flush();
+    if (wifi_log) wifi_log.flush();
     last_flush_ms = now;
   }
 }
@@ -385,6 +591,7 @@ void load_config() {
   config.rx_pin = preferences.getInt("rx_pin", kDefaultRxPin);
   config.tcp_port = preferences.getUShort("tcp_port", kDefaultTcpPort);
   active_segment = preferences.getUChar("segment", 0) % 2;
+  active_wifi_segment = preferences.getUChar("wifi_segment", 0) % 2;
   next_panic_index = preferences.getUChar("panic_idx", 0) % 3;
   panic_count = preferences.getUInt("panics", 0);
   boot_count = preferences.getUInt("boots", 0) + 1;
@@ -404,26 +611,32 @@ void start_wifi() {
   WiFi.setHostname(config.hostname.c_str());
 
   if (!config.ssid.isEmpty()) {
+    append_wifi_log("STA_CONNECT_ATTEMPT",
+                    String(F("ssid=\"")) + json_escape(config.ssid) + F("\" timeout_ms=") + String(kWifiConnectMs));
     WiFi.mode(WIFI_STA);
     WiFi.begin(config.ssid.c_str(), config.wifi_password.c_str());
     const uint32_t started = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - started < kWifiConnectMs) {
       service_target_uart();
+      service_wifi_monitor();
       delay(20);
     }
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    append_wifi_log("STA_INITIAL_TIMEOUT",
+                    String(F("ssid=\"")) + json_escape(config.ssid) + F("\" after_ms=") + String(kWifiConnectMs));
     WiFi.mode(config.ssid.isEmpty() ? WIFI_AP : WIFI_AP_STA);
     const uint64_t chip_id = ESP.getEfuseMac();
     char ap_name[32];
     snprintf(ap_name, sizeof(ap_name), "UART-Logger-%04X", static_cast<unsigned>(chip_id & 0xFFFF));
     ap_active = WiFi.softAP(ap_name, kApPassword);
+    append_wifi_log("FALLBACK_AP_RESULT",
+                    String(F("started=")) + (ap_active ? F("true") : F("false")) +
+                        F(" ssid=\"") + ap_name + F("\" ip=") + WiFi.softAPIP().toString());
   }
 
-  setenv("TZ", "CST-8", 1);
-  tzset();
-  configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+  configTzTime("CST-8", "pool.ntp.org", "time.google.com", "time.cloudflare.com");
 
   mdns_ready = MDNS.begin(config.hostname.c_str());
   if (mdns_ready) {
@@ -478,14 +691,39 @@ void handle_status() {
   String json = F("{");
   json += String(F("\"version\":\"")) + String(kVersion) + F("\",");
   json += String(F("\"network\":\"")) + json_escape(network_address()) + F("\",");
-  json += String(F("\"mode\":\"")) + String(ap_active ? "AP fallback" : "Wi-Fi STA") + F("\",");
+  const bool sta_connected = WiFi.status() == WL_CONNECTED;
+  const char *mode = sta_connected ? (ap_active ? "Wi-Fi STA + fallback AP" : "Wi-Fi STA")
+                                   : (ap_active ? "fallback AP only" : "offline");
+  json += String(F("\"mode\":\"")) + mode + F("\",");
   if (WiFi.status() == WL_CONNECTED) {
     const int rssi = WiFi.RSSI();
     const int quality = constrain(2 * (rssi + 100), 0, 100);
     json += String(F("\"wifi rssi\":\"")) + String(rssi) + F(" dBm (") + String(quality) + F("%)\",");
+    json += String(F("\"wifi ap\":\"")) + json_escape(WiFi.SSID()) + F(" / ") + WiFi.BSSIDstr() +
+            F(" / ch ") + String(WiFi.channel()) + F("\",");
   } else {
     json += F("\"wifi rssi\":\"not connected\",");
+    json += String(F("\"wifi ap\":\"")) + json_escape(config.ssid) + F(" (disconnected)\",");
   }
+  json += String(F("\"wifi connect events\":\"")) + String(wifi_connected_events) + F("\",");
+  json += String(F("\"wifi got-ip events\":\"")) + String(wifi_got_ip_events) + F("\",");
+  json += String(F("\"wifi disconnects\":\"")) + String(wifi_disconnected_events) + F("\",");
+  json += String(F("\"wifi lost-ip events\":\"")) + String(wifi_lost_ip_events) + F("\",");
+  if (last_wifi_disconnected_ms == 0) {
+    json += F("\"last wifi disconnect\":\"never this boot\",");
+  } else {
+    json += String(F("\"last wifi disconnect\":\"")) + String((millis() - last_wifi_disconnected_ms) / 1000) +
+            F(" s ago; ") + String(last_wifi_disconnect_reason) + F(" ") +
+            json_escape(WiFi.disconnectReasonName(static_cast<wifi_err_reason_t>(last_wifi_disconnect_reason))) + F("\",");
+  }
+  String wifi_link_uptime{F("not connected")};
+  if (sta_connected && last_wifi_got_ip_ms != 0) {
+    wifi_link_uptime = String((millis() - last_wifi_got_ip_ms) / 1000) + F(" s");
+  }
+  json += String(F("\"wifi link uptime\":\"")) + wifi_link_uptime + F("\",");
+  json += String(F("\"fallback ap\":\"")) + String(ap_active ? "on" : "off") + F("; clients=") +
+          String(ap_active ? WiFi.softAPgetStationNum() : 0) + F("; starts=") + String(fallback_ap_start_events) + F("\",");
+  json += String(F("\"wifi event queue drops\":\"")) + String(wifi_event_queue_drops) + F("\",");
   json += String(F("\"uart\":\"")) + String(config.baud) + F(" 8N1 RX GPIO") + String(config.rx_pin) + F("\",");
   json += String(F("\"tcp\":\"")) + String(config.tcp_port) + F(" (read-only)\",");
   json += String(F("\"captured bytes\":\"")) + uint64_string(total_uart_bytes) + F("\",");
@@ -502,6 +740,7 @@ void handle_status() {
   json += String(F("\"logger boots\":\"")) + String(boot_count) + F("\",");
   json += String(F("\"ota status\":\"")) + json_escape(ota_status) + F("\",");
   json += String(F("\"filesystem\":\"")) + String(fs_used) + F(" / ") + String(fs_total) + F(" bytes\",");
+  json += String(F("\"wifi logs\":\"")) + String(file_size(wifi_log_name(0)) + file_size(wifi_log_name(1))) + F(" bytes\",");
   json += String(F("\"heap\":\"")) + String(ESP.getFreeHeap()) + F(" bytes\",");
   json += String(F("\"uptime\":\"")) + String(millis() / 1000) + F(" s\"");
   json += F("}");
@@ -536,6 +775,10 @@ String files_page() {
     const String path = panic_log_name(i);
     html += String(F("<li><a href='/download?file=")) + path + F("'>") + path.substring(1) + F("</a> (") + String(file_size(path)) + F(" bytes)</li>");
   }
+  for (uint8_t i = 0; i < 2; ++i) {
+    const String path = wifi_log_name(i);
+    html += String(F("<li><a href='/download?file=")) + path + F("'>") + path.substring(1) + F("</a> (") + String(file_size(path)) + F(" bytes)</li>");
+  }
   html += F("</ul><form method='post' action='/clear' onsubmit=\"return confirm('確定清除所有日誌？')\"><button>清除所有日誌</button></form><p><a href='/'>返回</a></p></body></html>");
   return html;
 }
@@ -544,12 +787,14 @@ void handle_files() {
   if (!require_authentication()) return;
   if (main_log) main_log.flush();
   if (panic_log) panic_log.flush();
+  if (wifi_log) wifi_log.flush();
   web_server.send(200, "text/html; charset=utf-8", files_page());
 }
 
 bool is_allowed_log_path(const String &path) {
   for (uint8_t i = 0; i < 2; ++i) if (path == main_log_name(i)) return true;
   for (uint8_t i = 0; i < 3; ++i) if (path == panic_log_name(i)) return true;
+  for (uint8_t i = 0; i < 2; ++i) if (path == wifi_log_name(i)) return true;
   return false;
 }
 
@@ -562,6 +807,7 @@ void handle_download() {
   }
   if (main_log) main_log.flush();
   if (panic_log) panic_log.flush();
+  if (wifi_log) wifi_log.flush();
   File file = LittleFS.open(path, FILE_READ);
   web_server.sendHeader("Content-Disposition", String(F("attachment; filename=\"")) + path.substring(1) + F("\""));
   web_server.streamFile(file, "application/octet-stream");
@@ -571,16 +817,22 @@ void handle_download() {
 void clear_all_logs() {
   if (main_log) main_log.close();
   if (panic_log) panic_log.close();
+  if (wifi_log) wifi_log.close();
   for (uint8_t i = 0; i < 2; ++i) LittleFS.remove(main_log_name(i));
   for (uint8_t i = 0; i < 3; ++i) LittleFS.remove(panic_log_name(i));
+  for (uint8_t i = 0; i < 2; ++i) LittleFS.remove(wifi_log_name(i));
   active_segment = 0;
+  active_wifi_segment = 0;
   next_panic_index = 0;
   panic_capture_until = 0;
   panic_count = 0;
   preferences.putUChar("segment", active_segment);
+  preferences.putUChar("wifi_segment", active_wifi_segment);
   preferences.putUChar("panic_idx", next_panic_index);
   preferences.putUInt("panics", panic_count);
   open_main_log();
+  open_wifi_log();
+  append_wifi_log("LOGS_CLEARED");
 }
 
 void handle_clear() {
@@ -663,6 +915,8 @@ void handle_update_upload() {
   HTTPUpload &upload = web_server.upload();
   if (upload.status == UPLOAD_FILE_START) {
     if (main_log) main_log.flush();
+    if (panic_log) panic_log.flush();
+    if (wifi_log) wifi_log.flush();
     ota_upload_started = true;
     ota_received_bytes = 0;
     ota_upload_success = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
@@ -715,8 +969,14 @@ void start_web_server() {
 
 void setup_logger() {
   load_config();
+  setenv("TZ", "CST-8", 1);
+  tzset();
   filesystem_ready = LittleFS.begin(true);
-  if (filesystem_ready) open_main_log();
+  if (filesystem_ready) {
+    open_main_log();
+    open_wifi_log();
+    append_wifi_log("LOGGER_BOOT", String(F("boot=")) + String(boot_count) + F(" version=") + kVersion);
+  }
 
   // ESP32-C3 UART1 is routed through the GPIO matrix. TX is intentionally disabled.
   target_uart.setRxBufferSize(kHardwareRxBufferSize);
@@ -741,7 +1001,10 @@ void setup_logger() {
     }
   }
 
+  wifi_event_queue = xQueueCreate(kWifiEventQueueLength, sizeof(WifiEventRecord));
+  WiFi.onEvent(wifi_event_callback);
   start_wifi();
+  service_wifi_monitor(true);
   tcp_server = new WiFiServer(config.tcp_port);
   tcp_server->begin();
   tcp_server->setNoDelay(true);
@@ -761,6 +1024,7 @@ void setup() {
 
 void loop() {
   service_target_uart();
+  service_wifi_monitor();
   accept_tcp_clients();
   web_server.handleClient();
   if (ota_reboot_at != 0 && static_cast<int32_t>(millis() - ota_reboot_at) >= 0) {
