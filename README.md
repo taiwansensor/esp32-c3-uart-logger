@@ -2,7 +2,7 @@
 
 使用 ESP32-C3 製作的獨立、RX-only 無線 UART 診斷記錄器。它能在沒有電腦長時間接在設備旁的情況下，持續收集 ESP32、ESP8266、Arduino 或其他 3.3 V UART 裝置的啟動訊息、一般日誌、Watchdog 與 Panic Backtrace。
 
-目前版本：`0.1.0-alpha.2`
+目前版本：`0.1.0-alpha.3`
 
 > 本專案仍屬 Alpha。已完成 ESP32-C3 4 MB 實板、弱 Wi-Fi、Web OTA、長時間 UART 收集與循環檔案測試；正式用於關鍵設備前，請先依自己的板型、GPIO 與電壓完成驗證。
 
@@ -33,11 +33,13 @@ ESP32-C3 UART driver（16 KiB）
 - 24 KiB RAM 尾端緩衝，Web 可即時查看。
 - 兩個 384 KiB 一般日誌循環輪替。
 - 三個 128 KiB Panic 快照循環輪替。
+- 兩個 64 KiB Wi-Fi 事件日誌循環輪替，記錄連線、取得 IP、斷線原因及 fallback AP 用戶端事件。
+- 每 5 分鐘記錄上游 AP 的 SSID、BSSID、Channel、RSSI、IP、Heap 與 fallback AP 狀態。
 - Panic 事件發生時，保留事件前約 24 KiB，事件後繼續記錄 90 秒。
 - 辨識 ESP-IDF Panic、Backtrace、Assert、Task Watchdog、Brownout、Heap corruption 與 Stack canary。
 - 唯讀 TCP 2323 串流，最多三個用戶端；遠端送入的資料會被丟棄。
 - Wi-Fi AP 首次設定、mDNS、Wi-Fi 自動重連。
-- Web 顯示 RSSI、UART Error、Overflow、Queue drops、TCP skipped 與 Heap。
+- Web 顯示 RSSI、上游 AP、連線／斷線次數、最後斷線原因、Link uptime、UART Error、Queue drops 與 Heap。
 - Web OTA 更新 Logger 韌體。
 - Windows PowerShell 自動重連收集器。
 - 不需要第三方 Arduino 程式庫。
@@ -71,7 +73,7 @@ ESP32-C3 UART driver（16 KiB）
 5. 儲存後 Logger 自動重新啟動。
 6. 從路由器查詢 DHCP IP，或開啟 `http://uart-logger.local/`。
 
-ESP32-C3 不支援 5 GHz Wi-Fi。若 15 秒內無法連線，Logger 會回到設定 AP 模式。
+ESP32-C3 不支援 5 GHz Wi-Fi。若 15 秒內無法連線，Logger 會啟動 fallback AP，同時繼續嘗試 STA 自動重連；稍後連回原 Wi-Fi 時，fallback AP 仍會保留到下次重新啟動。
 
 Web 預設沒有密碼。設定 Web 密碼後會啟用 Basic Auth；勾選「清除 Web 密碼」即可恢復無密碼。Web 使用者預設為 `admin`。
 
@@ -80,13 +82,14 @@ Web 預設沒有密碼。設定 Web 密碼後會啟用 Basic Auth；勾選「清
 首頁包含：
 
 - UART 即時尾端畫面。
-- 網路 IP、Wi-Fi RSSI 與 Logger uptime。
+- 網路 IP、Wi-Fi RSSI、SSID／BSSID／Channel 與 Logger uptime。
+- Wi-Fi 連線、取得 IP、斷線、遺失 IP 次數，以及最後一次斷線原因與目前 Link uptime。
 - UART Error、Overflow 及最後發生時間。
 - 接收佇列丟棄位元組與 TCP skipped chunks。
 - Panic 快照數量、LittleFS 容量與可用 Heap。
 - 日誌下載、設定與 Web OTA。
 
-按下「清除畫面」只清除瀏覽器上的顯示，不會刪除 LittleFS 日誌。「清除所有日誌」才會刪除 Logger 內的檔案。
+按下「清除畫面」只清除瀏覽器上的顯示，不會刪除 LittleFS 日誌。「清除所有日誌」才會刪除 Logger 內的 UART、Panic 與 Wi-Fi 事件檔案。
 
 ## 日誌檔案
 
@@ -94,8 +97,9 @@ Web 預設沒有密碼。設定 Web 密碼後會啟用 Basic Auth；勾選「清
 |---|---|
 | `uart-0.log`、`uart-1.log` | 一般 UART 循環日誌 |
 | `panic-0.log`～`panic-2.log` | Panic 事件前後快照 |
+| `wifi-0.log`、`wifi-1.log` | Wi-Fi／AP 事件與每 5 分鐘心跳 |
 
-每次 Logger 開啟日誌時會插入包含 Logger 版本、開機次數與時間的分隔標頭。目標 UART 原始資料不會被改寫，但日誌並非逐位元組完全等同於目標輸出。
+每次 Logger 開啟日誌時會插入包含 Logger 版本、開機次數與時間的分隔標頭。Wi-Fi 日誌使用台灣時區（UTC+8）；NTP 尚未取得時間時改以 `uptime-ms` 標示。目標 UART 原始資料不會被改寫，但日誌並非逐位元組完全等同於目標輸出。
 
 ## Windows 長時間收集
 
